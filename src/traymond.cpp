@@ -13,6 +13,10 @@
 #include <sstream>
 #include <iomanip>
 #include <thread>
+#include <windows.h>
+#include <mmdeviceapi.h>
+#include <endpointvolume.h>
+#include <audiopolicy.h>
 
 #define VK_Z_KEY 0x5A
 #define WM_ICON 0x1C0A
@@ -23,6 +27,8 @@
 #define HIDE_FOREGROUND 0x96
 #define MNIT_AUTORUN 0x95
 #define MNIT_MLTICNS 0x94
+#define MUTE_FOREGROUND 0x93
+#define MUTE_MIXER 0x92
 #define FIRST_MENU 0xA0
 #define MAXIMUM_WINDOWS 100
 
@@ -537,6 +543,24 @@ void createTrayMenu(TRCONTEXT* context) {
     hideFgndWndItem.cch = home_page.size();
     hideFgndWndItem.wID = HIDE_FOREGROUND;
 
+    MENUITEMINFO muteFgndWndItem;
+    muteFgndWndItem.cbSize = sizeof(MENUITEMINFO);
+    muteFgndWndItem.fMask = MIIM_STRING | MIIM_ID;
+    muteFgndWndItem.fType = MFT_STRING;
+    string mute_text = "Toggle Mute of Foreground Window";
+    muteFgndWndItem.dwTypeData = (LPSTR)mute_text.c_str();
+    muteFgndWndItem.cch = mute_text.size();
+    muteFgndWndItem.wID = MUTE_FOREGROUND;
+
+    MENUITEMINFO muteMixerWndItem;
+    muteMixerWndItem.cbSize = sizeof(MENUITEMINFO);
+    muteMixerWndItem.fMask = MIIM_STRING | MIIM_ID;
+    muteMixerWndItem.fType = MFT_STRING;
+    string mute_mxxt = "Open System Mixer";
+    muteMixerWndItem.dwTypeData = (LPSTR)mute_mxxt.c_str();
+    muteMixerWndItem.cch = mute_mxxt.size();
+    muteMixerWndItem.wID = MUTE_MIXER;
+
     MENUITEMINFO autoRunMenu;
     autoRunMenu.cbSize = sizeof(MENUITEMINFO);
     autoRunMenu.fMask = MIIM_STRING | MIIM_ID | MIIM_STATE;
@@ -560,13 +584,75 @@ void createTrayMenu(TRCONTEXT* context) {
     InsertMenuItem(context->trayMenu, 0, FALSE, &homePageItem);
     InsertMenuItem(context->trayMenu, 0, FALSE, &exitMenuItem);
     InsertMenu(context->trayMenu, 0, MF_SEPARATOR | MF_BYPOSITION, 0, NULL);
+    InsertMenuItem(context->trayMenu, 0, FALSE, &muteFgndWndItem);
+    InsertMenuItem(context->trayMenu, 0, FALSE, &muteMixerWndItem);
+    InsertMenu(context->trayMenu, 0, MF_SEPARATOR | MF_BYPOSITION, 0, NULL);
     InsertMenuItem(context->trayMenu, 0, FALSE, &showAllMenuItem);
-    InsertMenuItem(context->trayMenu, 0, FALSE, &hideFgndWndItem);
+    InsertMenuItem(context->trayMenu, 0, FALSE, &hideFgndWndItem);    
+}
+
+void toggleMute(HWND hwnd)
+{
+    DWORD procID = NULL;
+    GetWindowThreadProcessId(hwnd, &procID);
+
+    CoInitialize(NULL);
+
+    // Get the speakers (1st render + multimedia) device
+    IMMDeviceEnumerator* deviceEnumerator = NULL;
+    CoCreateInstance(__uuidof(MMDeviceEnumerator), NULL, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (LPVOID*)&deviceEnumerator);    
+    IMMDevice* speakers = NULL;    
+    deviceEnumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &speakers);
+
+    // Activate the session manager, enumerator
+    IAudioSessionManager2* mgr = NULL;
+    IID IID_IAudioSessionManager2_;
+    IIDFromString((LPCOLESTR)L"{77AA99A0-1BD6-484F-8BC7-2C654C9A9B6F}", &IID_IAudioSessionManager2_);
+    speakers->Activate(IID_IAudioSessionManager2_, CLSCTX_ALL, NULL, (void**)&mgr);
+
+    // enumerate sessions for on this device
+    IAudioSessionEnumerator* sessionEnumerator = NULL;
+    mgr->GetSessionEnumerator(&sessionEnumerator);
+    int count;
+    sessionEnumerator->GetCount(&count);
+
+    for (int i = 0; i < count; i++)
+    {
+        IAudioSessionControl* ctl = NULL;
+        sessionEnumerator->GetSession(i, &ctl);
+        IAudioSessionControl2* ctl2 = NULL;
+        ctl->QueryInterface(__uuidof(IAudioSessionControl2), (void**)&ctl2);
+
+        DWORD val;
+        ctl2->GetProcessId(&val);
+
+        if ((int)val == (int)procID)
+        {
+            ISimpleAudioVolume* volumeControl = NULL;
+            ctl->QueryInterface(__uuidof(ISimpleAudioVolume), (void**)&volumeControl);
+            BOOL muted = NULL;
+            volumeControl->GetMute(&muted);
+            GUID g;
+            if (muted) volumeControl->SetMute(FALSE, &g);
+            else volumeControl->SetMute(TRUE, &g);
+            volumeControl->Release();
+        };
+
+        ctl2->Release();
+        ctl->Release();        
+    };
+    
+    sessionEnumerator->Release();
+    mgr->Release();
+    speakers->Release();
+    deviceEnumerator->Release();
+
+    CoUninitialize();
 }
 
 // Shows all hidden windows;
 void showAllWindows(TRCONTEXT* context) 
-{
+{    
     for (int i = 0; i < context->iconIndex; i++)
     {
         ShowWindow(context->icons[i].window, SW_SHOW);
@@ -636,6 +722,22 @@ void startup(TRCONTEXT* context)
     }
 }
 
+static BOOL CALLBACK enumMuteCallback(HWND hWnd, LPARAM lparam) {
+    int length = GetWindowTextLength(hWnd);
+    char* buffer = new char[length + 1];
+    GetWindowText(hWnd, buffer, length + 1);
+    std::string windowTitle(buffer);
+    delete[] buffer;
+
+    //if (IsWindowVisible(hWnd) && length != 0 && !(GetWindowLong(hWnd, GWL_EXSTYLE) & (WS_EX_TOOLWINDOW | WS_EX_TOPMOST)) && !(GetWindowLong(hWnd, GWL_STYLE) & WS_MINIMIZE))
+    if (IsWindowVisible(hWnd) && length != 0 && !(GetWindowLong(hWnd, GWL_EXSTYLE) & (WS_EX_TOOLWINDOW | WS_EX_TOPMOST)))
+    {
+        toggleMute(hWnd);
+        return FALSE;
+    };
+    return TRUE;
+}
+
 static BOOL CALLBACK enumWindowCallback(HWND hWnd, LPARAM lparam) {
     int length = GetWindowTextLength(hWnd);
     char* buffer = new char[length + 1];
@@ -652,10 +754,21 @@ static BOOL CALLBACK enumWindowCallback(HWND hWnd, LPARAM lparam) {
     return TRUE;
 }
 
-// Hide Next Foreground Window
+// Hide Foreground Window
 void hideNextForegroundWindow(TRCONTEXT* context)
 {
     EnumWindows(enumWindowCallback, (LPARAM)context);
+}
+
+// Mute Next Foreground Window
+void muteNextForegroundWindow(TRCONTEXT* context)
+{
+    EnumWindows(enumMuteCallback, (LPARAM)context);
+}
+
+void openSystemMixer(TRCONTEXT* context)
+{
+    ShellExecute(NULL, "OPEN", "SndVol.exe", NULL, NULL, 1);
 }
 
 void detectExplorerReloadThread(TRCONTEXT* context, NOTIFYICONDATA* icon)
@@ -723,8 +836,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                     case MNIT_AUTORUN:
                         toggleAutorun(context, true);
                         break;
-                    case HIDE_FOREGROUND:                             
-                        hideNextForegroundWindow(context);                  
+                    case HIDE_FOREGROUND:                    
+                        hideNextForegroundWindow(context);                           
+                        break;
+                    case MUTE_FOREGROUND:
+                        muteNextForegroundWindow(context);                         
+                        break;
+                    case MUTE_MIXER:
+                        openSystemMixer(context);                         
                         break;
                     case SHOW_HOMEPAGE:                    
                         ShellExecuteA(0, 0, "explorer.exe", "http://github.com/dkxce/traymond", 0, SW_SHOWMAXIMIZED);                                     
